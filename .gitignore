@@ -1,0 +1,6 @@
+embervisor
+embervisor-static
+*.o
+*.d
+guests/hello.bin
+nohup.out
