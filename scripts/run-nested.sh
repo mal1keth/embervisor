@@ -91,8 +91,13 @@ hello)
     poweroff -f ;;
 linux)
     echo "== embervisor booting L2 Linux (every instruction interpreted, minutes not seconds) =="
+    # lpj= presets loops_per_jiffy, skipping calibrate_delay's pure CPU
+    # spin: QEMU's TCG-SVM appears unable to open an interrupt window
+    # into a never-exiting guest, so timer IRQs only land around exits
+    # (HLT, I/O). Skipping the spin lets boot reach the HLT-ing idle
+    # loop, where injection works. Harmless on real hardware.
     /ember/embervisor --kernel /ember/bzImage --initrd /ember/inner.cpio.gz \
-        --cmdline "console=ttyS0 reboot=t panic=-1 i8042.nokbd i8042.noaux rdinit=/init ember.probe=1"
+        --cmdline "console=ttyS0 reboot=t panic=-1 lpj=3000000 i8042.nokbd i8042.noaux rdinit=/init ember.probe=1"
     echo "== rig: linux mode complete =="
     poweroff -f ;;
 kindling)
