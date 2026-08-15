@@ -26,6 +26,11 @@ Linux (none) 6.12.43 #1 SMP PREEMPT_DYNAMIC x86_64 GNU/Linux
 hello from inside the VM
 ```
 
+![embervisor booting Linux 6.12 to userspace, captured in the nested rig](docs/demo.png)
+
+The capture is an unedited run in the nested rig described below. Replay
+it with `asciinema play docs/demo.cast`.
+
 ## Build and run
 
 ```sh
