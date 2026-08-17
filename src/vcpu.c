@@ -150,6 +150,91 @@ void vcpu_setup_linux32(struct vcpu *vcpu, uint64_t rip, uint64_t boot_params)
         die("KVM_SET_REGS: %m");
 }
 
+static void dump_seg(const char *name, const struct kvm_segment *s)
+{
+    fprintf(stderr,
+            "  %-4s sel=%#06x base=%#010llx limit=%#010x type=%#x "
+            "s=%u dpl=%u p=%u db=%u l=%u g=%u unusable=%u\n",
+            name, s->selector, (unsigned long long)s->base, s->limit,
+            s->type, s->s, s->dpl, s->present, s->db, s->l, s->g,
+            s->unusable);
+}
+
+static void dump_guest_mem(struct vm *vm, uint64_t addr, uint64_t len,
+                           const char *tag)
+{
+    uint64_t i, j;
+
+    if (addr >= vm->ram_size || len > vm->ram_size - addr) {
+        fprintf(stderr, "  %s: %#llx+%#llx outside guest RAM\n",
+                tag, (unsigned long long)addr, (unsigned long long)len);
+        return;
+    }
+    for (i = 0; i < len; i += 16) {
+        fprintf(stderr, "  %s %#010llx:", tag, (unsigned long long)(addr + i));
+        for (j = i; j < len && j < i + 16; j++)
+            fprintf(stderr, " %02x", vm->ram[addr + j]);
+        fprintf(stderr, "\n");
+    }
+}
+
+/*
+ * Post-mortem: where was the vCPU when it died? On a triple fault the
+ * exit reason alone says nothing; RIP relative to the entry point tells
+ * us whether the very first instruction faulted or the guest got some
+ * distance first, and CR0/CS reveal whether anyone modified the state
+ * we forged in vcpu_setup_linux32().
+ */
+static void vcpu_dump_state(struct vcpu *vcpu, const char *why)
+{
+    struct kvm_regs r;
+    struct kvm_sregs s;
+
+    if (ioctl(vcpu->fd, KVM_GET_REGS, &r) < 0 ||
+        ioctl(vcpu->fd, KVM_GET_SREGS, &s) < 0) {
+        fprintf(stderr, "embervisor: %s, and state fetch failed: %m\n", why);
+        return;
+    }
+    fprintf(stderr, "embervisor: vcpu state at %s:\n", why);
+    fprintf(stderr, "  rip=%#llx rsp=%#llx rbp=%#llx rflags=%#llx\n",
+            (unsigned long long)r.rip, (unsigned long long)r.rsp,
+            (unsigned long long)r.rbp, (unsigned long long)r.rflags);
+    fprintf(stderr, "  rax=%#llx rbx=%#llx rcx=%#llx rdx=%#llx\n",
+            (unsigned long long)r.rax, (unsigned long long)r.rbx,
+            (unsigned long long)r.rcx, (unsigned long long)r.rdx);
+    fprintf(stderr, "  rsi=%#llx rdi=%#llx\n",
+            (unsigned long long)r.rsi, (unsigned long long)r.rdi);
+    fprintf(stderr, "  cr0=%#llx cr2=%#llx cr3=%#llx cr4=%#llx efer=%#llx\n",
+            (unsigned long long)s.cr0, (unsigned long long)s.cr2,
+            (unsigned long long)s.cr3, (unsigned long long)s.cr4,
+            (unsigned long long)s.efer);
+    fprintf(stderr, "  gdt=%#llx/%#x idt=%#llx/%#x\n",
+            (unsigned long long)s.gdt.base, s.gdt.limit,
+            (unsigned long long)s.idt.base, s.idt.limit);
+    dump_seg("cs", &s.cs);
+    dump_seg("ss", &s.ss);
+    dump_seg("ds", &s.ds);
+    dump_seg("tr", &s.tr);
+
+    /* The top of the stack usually holds return addresses. */
+    dump_guest_mem(vcpu->vm, r.rsp, 128, "stk");
+
+    /*
+     * EMBER_DUMP=addr:len[,addr:len...] (hex): extra guest ranges to
+     * hexdump post-mortem, e.g. known variables in the dead kernel.
+     */
+    const char *ranges = getenv("EMBER_DUMP");
+    while (ranges && *ranges) {
+        char *end;
+        uint64_t addr = strtoull(ranges, &end, 16);
+        if (*end != ':')
+            break;
+        uint64_t len = strtoull(end + 1, &end, 16);
+        dump_guest_mem(vcpu->vm, addr, len, "mem");
+        ranges = *end == ',' ? end + 1 : NULL;
+    }
+}
+
 /* Ports we knowingly ignore instead of warning about. */
 static bool port_is_boring(uint16_t port)
 {
@@ -238,9 +323,11 @@ int vcpu_loop(struct vcpu *vcpu, struct serial *serial)
             fflush(stdout);
             fprintf(stderr, "\nembervisor: guest reset (triple fault), "
                             "shutting down\n");
+            vcpu_dump_state(vcpu, "triple fault");
             return 0;
 
         case KVM_EXIT_FAIL_ENTRY:
+            vcpu_dump_state(vcpu, "failed VMENTER");
             die("VMENTER failed, hw reason %#llx (invalid guest state?)",
                 (unsigned long long)
                 run->fail_entry.hardware_entry_failure_reason);

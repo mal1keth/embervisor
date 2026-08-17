@@ -15,6 +15,7 @@ static void usage(int code)
 "usage:\n"
 "  embervisor --kernel bzImage [--initrd FILE] [--cmdline STR] [--mem MiB]\n"
 "  embervisor --flat payload.bin [--mem MiB]\n"
+"  embervisor --flat32 payload.bin [--mem MiB]\n"
 "\n"
 "options:\n"
 "  -k, --kernel FILE    boot a Linux bzImage (32-bit boot protocol)\n"
@@ -22,6 +23,8 @@ static void usage(int code)
 "  -c, --cmdline STR    kernel command line\n"
 "                       (default: \"%s\")\n"
 "  -f, --flat FILE      run a flat real-mode binary at %#llx instead\n"
+"  -F, --flat32 FILE    run a flat 32-bit binary at 1 MiB with the exact\n"
+"                       protected-mode entry state the kernel path uses\n"
 "  -m, --mem MIB        guest RAM in MiB (default 256)\n"
 "  -v, --verbose        chatty diagnostics on stderr\n"
 "  -h, --help           this text\n"
@@ -34,7 +37,7 @@ static void usage(int code)
 
 int main(int argc, char **argv)
 {
-    const char *kernel = NULL, *initrd = NULL, *flat = NULL;
+    const char *kernel = NULL, *initrd = NULL, *flat = NULL, *flat32 = NULL;
     const char *cmdline = DEFAULT_CMDLINE;
     uint64_t mem_mib = 256;
     struct vm vm;
@@ -47,26 +50,29 @@ int main(int argc, char **argv)
         { "initrd",  required_argument, NULL, 'i' },
         { "cmdline", required_argument, NULL, 'c' },
         { "flat",    required_argument, NULL, 'f' },
+        { "flat32",  required_argument, NULL, 'F' },
         { "mem",     required_argument, NULL, 'm' },
         { "verbose", no_argument,       NULL, 'v' },
         { "help",    no_argument,       NULL, 'h' },
         { 0 },
     };
 
-    while ((c = getopt_long(argc, argv, "k:i:c:f:m:vh", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "k:i:c:f:F:m:vh", opts, NULL)) != -1) {
         switch (c) {
         case 'k': kernel = optarg; break;
         case 'i': initrd = optarg; break;
         case 'c': cmdline = optarg; break;
         case 'f': flat = optarg; break;
+        case 'F': flat32 = optarg; break;
         case 'm': mem_mib = strtoull(optarg, NULL, 0); break;
         case 'v': ember_verbose = true; break;
         case 'h': usage(0);
         default:  usage(1);
         }
     }
-    if (!!kernel == !!flat) {
-        fprintf(stderr, "embervisor: need exactly one of --kernel/--flat\n\n");
+    if (!!kernel + !!flat + !!flat32 != 1) {
+        fprintf(stderr,
+                "embervisor: need exactly one of --kernel/--flat/--flat32\n\n");
         usage(1);
     }
     if (mem_mib < 16 || (kernel && mem_mib < 64))
@@ -85,6 +91,18 @@ int main(int argc, char **argv)
 
         uint64_t entry = load_bzimage(&vm, kernel, initrd, cmdline);
         vcpu_setup_linux32(&vcpu, entry, EMBER_BOOT_PARAMS_ADDR);
+    } else if (flat32) {
+        /*
+         * Diagnostic twin of the kernel path: same load address, same
+         * forged entry state, but a payload of a dozen instructions.
+         * Separates "protected-mode entry is broken" from "the kernel
+         * tripped later" when debugging a new host.
+         */
+        vcpu_init(&vcpu, &vm, 0);
+        vcpu_set_cpuid(&vcpu);
+
+        load_flat(&vm, flat32, EMBER_KERNEL_LOAD_ADDR);
+        vcpu_setup_linux32(&vcpu, EMBER_KERNEL_LOAD_ADDR, 0);
     } else {
         vcpu_init(&vcpu, &vm, 0);
         vcpu_set_cpuid(&vcpu);

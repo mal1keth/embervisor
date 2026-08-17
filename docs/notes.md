@@ -164,7 +164,109 @@ world switches, and it produces the most satisfying `uname -a` I have
 ever read. The rig doubles as the test harness for the kindling modules,
 which load into L1 directly.
 
-## 8. Scope cuts, and what each would cost
+## 8. A QEMU TCG-SVM bug, and how the rig cornered it
+
+The nested rig earns its keep here. embervisor boots Linux fine when the
+rig runs on **QEMU 8.2** (Ubuntu 24.04). On **QEMU 10.0** (Debian 13) the
+*same* embervisor binary and *same* bzImage triple-fault on the **first
+VMRUN** of the protected-mode guest: the very first `KVM_RUN` returns
+`KVM_EXIT_SHUTDOWN`, zero serial output. Real-mode (`hello`) guests work
+on both. This is the story of running that down; the short version is
+that it is a bug in QEMU's own instruction decoder, not in embervisor,
+and there is a one-line fix.
+
+**Where it dies.** A `KVM_GET_REGS`/`KVM_GET_SREGS` in the
+`KVM_EXIT_SHUTDOWN` path (`vcpu_dump_state` in `vcpu.c`) puts the corpse
+on the table: `RIP = CR2 = 0x…b453`, i.e. an *instruction-fetch* page
+fault — the faulting address is the instruction pointer itself — with
+`CR3` equal to the kernel's `_pgtable`. Matching `RIP` against the
+decompression stub's `vmlinux` symbols lands inside `memset`, called
+(per the return address on the guest stack) from the *else* branch of
+`initialize_identity_maps()`. That branch runs `memset(_pgtable, 0,
+BOOT_PGT_SIZE)` — and `CR3` already points at `_pgtable`. The stub is
+zeroing its own live top-level page table, so the next instruction fetch
+has no mapping: #PF → #DF → shutdown.
+
+That branch is guarded precisely to avoid this. The stub reads its own
+`CR3` (`read_cr3_pa()`) and, if it already equals `_pgtable`, takes the
+*append* branch instead of the *overwrite* branch. So the guest must be
+**misreading CR3**.
+
+**Isolating the entry state.** Before blaming CR3, rule out our forged
+protected-mode state. The `--flat32` mode (see `main.c`) enters a
+dozen-instruction payload at 1 MiB with the *exact* segment and
+control-register state `vcpu_setup_linux32` hands the kernel, climbs it
+into 64-bit long mode under its own page tables, and prints what it
+sees. It boots to `HLT` cleanly on QEMU 10 — so entry-state handling is
+fine, and the fault is something the *kernel stub* does that the payload
+doesn't. But the same payload also printed the tell: it loaded
+`CR3 = 0x30000`, then read it straight back as `0x024c8000`, and read
+`CR4` back as `0x60` when it had written `0x20`. The reads were
+returning host/shadow state, not the guest's.
+
+**The bug.** Built QEMU 10.0.0 from source with two `fprintf`s in
+`target/i386/tcg/system/svm_helper.c`: one per VMRUN dumping the loaded
+intercept bitmaps, one in `cpu_svm_check_intercept_param` logging every
+CR/DR intercept check. The failing boot's last check before death is
+unambiguous:
+
+```
+chk type=000 eip=…d990 (initialize_identity_maps) cr_read=0018 hit=0
+```
+
+`type=000` is `SVM_EXIT_READ_CR0`. But the instruction is `MOV %cr3,%rax`
+— it should be checked as `SVM_EXIT_READ_CR3` (`0x003`). Because it is
+mistyped as a CR0 read, and KVM has by then **cleared** the CR0-read
+intercept (`cr_read = 0x0018`: bits 3 and 4 set for CR3/CR4, bit 0
+clear), the check misses, no #VMEXIT happens, and QEMU emulates the read
+locally — handing the guest the shadow CR3.
+
+Why CR0 clear but CR3 set: with NPT off, `kvm_amd` runs shadow paging and
+uses the CR3 read/write intercepts to virtualize CR3, while its
+"selective CR0 write" optimization *drops* the CR0 intercepts once the
+guest's CR0 matches the host's. That steady state — CR0 reads free, CR3
+reads trapped — is exactly what a booting kernel reaches, and exactly
+what the mistyped check breaks.
+
+The defect is in QEMU's new x86 decoder,
+`target/i386/tcg/decode-new.c.inc`. For a MOV to/from CRn it adds the
+register number to the base SVM exit code:
+
+```c
+if (decode->e.intercept) {       /* WRONG: SVM_EXIT_READ_CR0 == 0x000 */
+    decode->e.intercept += op->n;
+}
+```
+
+`svm(READ_CR0)` sets `.intercept = 0` **and** `.has_intercept = true`.
+The guard tests the value, not the flag, so for CR *reads* (base code 0)
+it is false and `op->n` is never added — every CR read is checked as a
+CR0 read. Writes (`WRITE_CR0 = 0x010`) and DR access (`READ_DR0 =
+0x020`) have non-zero bases, so they were correct and the bug stayed
+invisible. The fix is to test the flag the decoder already sets:
+
+```c
+if (decode->e.has_intercept) {
+    decode->e.intercept += op->n;
+}
+```
+
+Rebuilt with that one line, the rig boots L2 Linux all the way to
+userspace on QEMU 10 (`== L2 probe: Linux is alive under embervisor ==`,
+`model name: Hammer`, then a clean `reboot=t` exit). The bug is present
+unchanged on QEMU `master`, so it is worth reporting upstream; the
+`--flat32` payload is a kernel-free reproducer (writes CR3, reads back a
+different value). QEMU 8.2 predates this decoder, which is why 8.2
+worked.
+
+**Honest scope.** The failure needs the whole tower — QEMU-TCG emulating
+SVM, `kvm_amd` doing shadow paging on top of it — so it is a corner
+almost nothing else exercises, and none of it is embervisor's fault.
+What the rig proved is narrower and solid: given a real `/dev/kvm`,
+embervisor's boot path is correct, and the triple fault was the platform
+underneath lying to the guest about CR3.
+
+## 9. Scope cuts, and what each would cost
 
 | absent | what it would take |
 |---|---|

@@ -12,8 +12,9 @@
 #   L1: our kernel + busybox, /dev/kvm courtesy of emulated SVM
 #   L2: whatever embervisor boots (hello payload, or Linux again)
 #
-# usage: run-nested.sh [hello|linux|kindling|shell]
+# usage: run-nested.sh [hello|flat32|linux|kindling|shell]
 #   hello      embervisor runs the bare-metal serial payload in L2
+#   flat32     minimal 32-bit protected-mode payload, kernel-path entry state
 #   linux      embervisor boots Linux-in-Linux to an automated probe
 #   kindling   no nesting: load + test the kindling modules in L1
 #   shell      interactive L1 shell to poke around (default)
@@ -52,6 +53,7 @@ mkdir -p "$R/bin" "$R/ember" "$R/kindling"
 cp "$BB" "$R/bin/busybox"; chmod 755 "$R/bin/busybox"
 cp "$HERE/embervisor-static" "$R/ember/embervisor"
 cp "$HERE/guests/hello.bin" "$R/ember/hello.bin"
+cp "$HERE/guests/hello32.bin" "$R/ember/hello32.bin"
 cp "$KERNEL" "$R/ember/bzImage"
 cp "$STAGE/inner.cpio.gz" "$R/ember/inner.cpio.gz"
 if ls "$KC"/kindling/*.ko > /dev/null 2>&1; then
@@ -89,6 +91,12 @@ hello)
     /ember/embervisor --flat /ember/hello.bin
     echo "== rig: hello mode complete (exit $?) =="
     poweroff -f ;;
+flat32)
+    echo "== L1 cpu flags of interest: $(grep -m1 ^flags /proc/cpuinfo \
+        | tr ' ' '\n' | grep -xE 'la57|svm|npt' | tr '\n' ' ') =="
+    /ember/embervisor -v --flat32 /ember/hello32.bin
+    echo "== rig: flat32 mode complete (exit $?) =="
+    poweroff -f ;;
 linux)
     echo "== embervisor booting L2 Linux (every instruction interpreted, minutes not seconds) =="
     # lpj= presets loops_per_jiffy, skipping calibrate_delay's pure CPU
@@ -96,6 +104,8 @@ linux)
     # into a never-exiting guest, so timer IRQs only land around exits
     # (HLT, I/O). Skipping the spin lets boot reach the HLT-ing idle
     # loop, where injection works. Harmless on real hardware.
+    # EMBER_DUMP=addr:len[,...] (hex) hexdumps guest ranges on a triple
+    # fault; handy when chasing where a boot dies. See docs/notes.md §8.
     /ember/embervisor --kernel /ember/bzImage --initrd /ember/inner.cpio.gz \
         --cmdline "console=ttyS0 reboot=t panic=-1 lpj=3000000 i8042.nokbd i8042.noaux rdinit=/init ember.probe=1"
     echo "== rig: linux mode complete =="
@@ -126,9 +136,12 @@ kindling) CPUFLAGS="-smp 2 -accel tcg,thread=multi -cpu qemu64" ;;
 esac
 
 echo "rig: L1 initramfs $(du -h "$STAGE/l1.cpio.gz" | cut -f1), starting QEMU (pure TCG)..."
+# EMBER_QEMU_EXTRA: extra L0 QEMU flags for debugging, e.g.
+#   EMBER_QEMU_EXTRA="-d int -D /tmp/int.log" run-nested.sh linux
+# logs every exception/interrupt TCG delivers, L1's and L2's alike.
 exec qemu-system-x86_64 \
     -M pc -m 2048 $CPUFLAGS \
     -kernel "$KERNEL" \
     -initrd "$STAGE/l1.cpio.gz" \
     -append "console=ttyS0 ember.mode=$MODE" \
-    -nographic -no-reboot
+    -nographic -no-reboot ${EMBER_QEMU_EXTRA:-}

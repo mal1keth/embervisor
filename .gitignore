@@ -3,4 +3,5 @@ embervisor-static
 *.o
 *.d
 guests/hello.bin
+guests/hello32.bin
 nohup.out
