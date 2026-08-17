@@ -229,21 +229,36 @@ reads trapped — is exactly what a booting kernel reaches, and exactly
 what the mistyped check breaks.
 
 The defect is in QEMU's new x86 decoder,
-`target/i386/tcg/decode-new.c.inc`. For a MOV to/from CRn it adds the
-register number to the base SVM exit code:
+`target/i386/tcg/decode-new.c.inc`, and it is the *second* of two guards
+that both confuse the **value** of the SVM exit code with a "has an
+intercept" **flag**. Both stem from `SVM_EXIT_READ_CR0` being numerically
+`0x000`.
+
+The first guard — *whether to emit an intercept check at all* — was
+already fixed upstream. Paolo Bonzini's "target/i386: fix processing of
+intercept 0 (read CR0)" (qemu-devel, June 2024) introduced the
+`has_intercept` flag precisely because exit code `0` was read as "no
+intercept", and changed the dispatch site to `if (decode.e.has_intercept
+&& GUEST(s))`. That shipped in QEMU 9.1.0, so it is present in the whole
+10.0 line — this is *not* that bug, and credit for spotting the pattern
+is his.
+
+The guard that bites here is a different line: the one in `decode_op`
+(the `X86_TYPE_C` / `X86_TYPE_D` cases) that adds the register number so
+a CR3 read becomes `READ_CR3` instead of `READ_CR0`:
 
 ```c
-if (decode->e.intercept) {       /* WRONG: SVM_EXIT_READ_CR0 == 0x000 */
+if (decode->e.intercept) {       /* still the value, not the flag */
     decode->e.intercept += op->n;
 }
 ```
 
-`svm(READ_CR0)` sets `.intercept = 0` **and** `.has_intercept = true`.
-The guard tests the value, not the flag, so for CR *reads* (base code 0)
-it is false and `op->n` is never added — every CR read is checked as a
-CR0 read. Writes (`WRITE_CR0 = 0x010`) and DR access (`READ_DR0 =
-0x020`) have non-zero bases, so they were correct and the bug stayed
-invisible. The fix is to test the flag the decoder already sets:
+`svm(READ_CR0)` sets `.intercept = 0` and `.has_intercept = true`. This
+guard still tests the value, so for a CR *read* (base `0`) it is false
+and `op->n` is never added — CR3/CR4/CR8 reads keep exit code `0` and are
+checked against the CR0-read intercept bit. Writes (`WRITE_CR0 = 0x010`)
+and DR access (`READ_DR0 = 0x020`) have non-zero bases, so they were
+unaffected. The fix mirrors Bonzini's — test the flag, not the value:
 
 ```c
 if (decode->e.has_intercept) {
@@ -252,12 +267,22 @@ if (decode->e.has_intercept) {
 ```
 
 Rebuilt with that one line, the rig boots L2 Linux all the way to
-userspace on QEMU 10 (`== L2 probe: Linux is alive under embervisor ==`,
-`model name: Hammer`, then a clean `reboot=t` exit). The bug is present
-unchanged on QEMU `master`, so it is worth reporting upstream; the
-`--flat32` payload is a kernel-free reproducer (writes CR3, reads back a
-different value). QEMU 8.2 predates this decoder, which is why 8.2
-worked.
+userspace on QEMU 10.0.0 (`== L2 probe: Linux is alive under embervisor
+==`, `model name: Hammer`, then a clean `reboot=t` exit); unpatched
+10.0.0 triple-faults on the same input. QEMU 8.2 predates this decoder
+entirely, which is why 8.2 worked.
+
+**Upstream status — stated precisely, because the sibling fix is a
+trap.** This operand-adjustment guard is still `if (decode->e.intercept)`
+in the 10.0.0 tree I built *and* in current `master` — verified by
+reading `decode-new.c.inc` (the `X86_TYPE_C`/`X86_TYPE_D` cases), **not**
+by running a `master` build. So the accurate claim is: a *second
+instance* of the exact pattern Bonzini fixed at the dispatch site is
+still open at the operand site; it is not a fresh, unrelated discovery.
+The runtime evidence that it is live on the shipped Debian binary is the
+`--flat32` reproducer: on QEMU **10.0.11** it loads `CR3 = 0x30000` and
+reads it straight back as `0x024c8000` (host/shadow CR3), no kernel
+involved. Any upstream report should lead with that framing.
 
 **Honest scope.** The failure needs the whole tower — QEMU-TCG emulating
 SVM, `kvm_amd` doing shadow paging on top of it — so it is a corner
